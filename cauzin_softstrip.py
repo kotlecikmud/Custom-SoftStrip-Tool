@@ -1,9 +1,7 @@
 """
 ---ABOUT---
 
-Program for calculating median for image set.
-
-Script Name: calc_median.py
+Script Name: cauzin_softstrip.py
 Author: Filip Pawłowski
 Contact: filippawlowski2012@gmail.com
 """
