@@ -6,281 +6,134 @@ Author: Filip Pawłowski
 Contact: filippawlowski2012@gmail.com
 """
 
-__version__ = "00.01.00.00"
+__version__ = "00.02.00.00"
 
-from PIL import Image, ImageDraw
-import numpy as np
-import tkinter as tk
-from tkinter import filedialog, messagebox
+from PIL import Image
 import os
-import cv2
 
-# Constants
-SYNC_HEADER = '10101010' * 2
-CHUNK_SIZE = 1024
-MARGIN_SIZE = 40  # Pixels for margin around the data area
-MARKER_SIZE = 20  # Size of corner markers
-CALIBRATION_STRIP_HEIGHT = 10  # Height of calibration strip
+while True:
+    choice = input(f"Custom Softstrip Tool - v{__version__}\nchoose: encode/decode >>>")
 
+    if choice == "decode":
+        def decode_softstrip(softstrip_image_path, img_width=256, padding=10):
+            """
+            Decodes binary data from a SoftStrip image format.
 
-def add_alignment_markers(img):
-    """Add corner markers and calibration strip to the image"""
-    width, height = img.size
-    new_width = width + (MARGIN_SIZE * 2)
-    new_height = height + (MARGIN_SIZE * 2) + CALIBRATION_STRIP_HEIGHT
+            :param softstrip_image_path: Path to the SoftStrip image to decode.
+            :param img_width: Width of the SoftStrip image in pixels (should match encoding).
+            :param padding: Number of pixels of padding around the SoftStrip code (should match encoding).
+            :return: Decoded binary data.
+            """
+            # Open the SoftStrip image
+            img = Image.open(softstrip_image_path).convert("1")  # Convert to binary (1-bit) mode
+            img_width, img_height = img.size
 
-    # Create new image with margins
-    new_img = Image.new('L', (new_width, new_height), 255)
-    draw = ImageDraw.Draw(new_img)
+            # Calculate the usable width and height for data, excluding padding
+            usable_width = img_width - 2 * padding
+            usable_height = img_height - 2 * padding
 
-    # Paste original image in center
-    new_img.paste(img, (MARGIN_SIZE, MARGIN_SIZE))
+            # Decode binary data from image pixels
+            data = bytearray()
+            byte = 0
+            bit_count = 0
 
-    # Draw corner markers (L-shaped)
-    def draw_L_marker(x, y, flip_x=False, flip_y=False):
-        x1, y1 = x, y
-        x2, y2 = x + (MARKER_SIZE if not flip_x else -MARKER_SIZE), y
-        x3, y3 = x, y + (MARKER_SIZE if not flip_y else -MARKER_SIZE)
+            for y in range(padding, padding + usable_height):
+                for x in range(padding, padding + usable_width):
+                    # Check if the pixel is black (0) or white (1)
+                    pixel = img.getpixel((x, y))
+                    if pixel == 0:  # Black pixel represents a '1' bit
+                        byte = (byte << 1) | 1
+                    else:  # White pixel represents a '0' bit
+                        byte = (byte << 1)
 
-        draw.line([(x1, y1), (x2, y2)], fill=0, width=3)
-        draw.line([(x1, y1), (x3, y3)], fill=0, width=3)
+                    bit_count += 1
+                    # Once we've collected 8 bits, add the byte to data
+                    if bit_count == 8:
+                        data.append(byte)
+                        byte = 0
+                        bit_count = 0
 
-    # Draw corner markers
-    draw_L_marker(MARGIN_SIZE // 2, MARGIN_SIZE // 2)  # Top-left
-    draw_L_marker(new_width - MARGIN_SIZE // 2, MARGIN_SIZE // 2, flip_x=True)  # Top-right
-    draw_L_marker(MARGIN_SIZE // 2, new_height - MARGIN_SIZE // 2 - CALIBRATION_STRIP_HEIGHT,
-                  flip_y=True)  # Bottom-left
-    draw_L_marker(new_width - MARGIN_SIZE // 2, new_height - MARGIN_SIZE // 2 - CALIBRATION_STRIP_HEIGHT, flip_x=True,
-                  flip_y=True)  # Bottom-right
-
-    # Add calibration strip at bottom
-    strip_y = new_height - CALIBRATION_STRIP_HEIGHT
-    strip_width = (new_width - MARGIN_SIZE * 2) // 4
-    for i in range(4):
-        x = MARGIN_SIZE + (i * strip_width)
-        color = int(255 * (3 - i) / 3)  # White to black gradient
-        draw.rectangle([x, strip_y, x + strip_width, new_height], fill=color)
-
-    return new_img
+            print("Decoding complete.")
+            return bytes(data)
 
 
-def detect_and_transform(image):
-    """Detect markers and transform image to correct perspective"""
-    # Convert to numpy array and ensure grayscale
-    img_array = np.array(image)
-    if len(img_array.shape) > 2:
-        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-    else:
-        gray = img_array
+        # Example usage
+        softstrip_image_path = input("path/to/your/softstrip_image.png >>>")
+        decoded_data = decode_softstrip(softstrip_image_path)
 
-    # Threshold the image
-    _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+        # Save the decoded data to a file if needed
+        output_file_path = "decoded_file.txt"
+        with open(output_file_path, "wb") as file:
+            file.write(decoded_data)
+        print(f"Decoded data saved to {output_file_path}")
 
-    # Find contours
-    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    elif choice == "encode":
+        def encode_softstrip(input_file_path, output_image_path, img_width=256, padding=10):
+            """
+            Encodes binary data from a file into a SoftStrip image format.
 
-    # Find L-shaped markers
-    corners = []
-    for contour in contours:
-        if len(contour) > 10:  # Filter small contours
-            # Approximate contour to polygon
-            epsilon = 0.02 * cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, epsilon, True)
+            :param input_file_path: Path to the binary file to encode.
+            :param output_image_path: Path to save the generated SoftStrip image.
+            :param img_width: Width of the SoftStrip image in pixels.
+            :param padding: Number of pixels of padding around the SoftStrip code.
+            """
+            # Read the binary data from the file
+            with open(input_file_path, "rb") as file:
+                data = file.read()
 
-            # L-shaped markers should have 6 points
-            if len(approx) == 6:
-                # Get the centroid
-                M = cv2.moments(contour)
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                    corners.append((cx, cy))
+            # Calculate the number of rows needed for the image
+            rows = (len(data) * 8) // img_width + 1  # Each byte has 8 bits
 
-    # If we found all 4 corners
-    if len(corners) == 4:
-        # Sort corners to get them in correct order (top-left, top-right, bottom-left, bottom-right)
-        corners = np.array(corners)
-        center = np.mean(corners, axis=0)
+            # Create a blank (white) image with padding
+            img_height = rows + 2 * padding
+            img = Image.new("1", (img_width + 2 * padding, img_height), 1)  # '1' mode for binary (1-bit) image
 
-        def sort_corners(corners, center):
-            return [
-                corners[np.argmin(np.linalg.norm(corners - center + [-1, -1], axis=1))],  # Top-left
-                corners[np.argmin(np.linalg.norm(corners - center + [1, -1], axis=1))],  # Top-right
-                corners[np.argmin(np.linalg.norm(corners - center + [-1, 1], axis=1))],  # Bottom-left
-                corners[np.argmin(np.linalg.norm(corners - center + [1, 1], axis=1))]  # Bottom-right
-            ]
+            # Draw the SoftStrip pattern on the image
+            for i, byte in enumerate(data):
+                for bit in range(8):
+                    if byte & (1 << (7 - bit)):  # Check each bit (MSB to LSB)
+                        # Calculate pixel position
+                        x = padding + (i * 8 + bit) % img_width
+                        y = padding + (i * 8 + bit) // img_width
+                        img.putpixel((x, y), 0)  # Set pixel to black (0) if bit is 1
 
-        corners = sort_corners(corners, center)
+            # Add alignment markers
+            img = add_alignment_markers(img)
 
-        # Define destination points (rectangle)
-        width = height = 800  # Fixed size output
-        dst_points = np.array([
-            [MARGIN_SIZE, MARGIN_SIZE],
-            [width - MARGIN_SIZE, MARGIN_SIZE],
-            [MARGIN_SIZE, height - MARGIN_SIZE],
-            [width - MARGIN_SIZE, height - MARGIN_SIZE]
-        ], dtype=np.float32)
-
-        # Calculate perspective transform
-        matrix = cv2.getPerspectiveTransform(np.float32(corners), dst_points)
-
-        # Apply transform
-        transformed = cv2.warpPerspective(gray, matrix, (width, height))
-
-        return Image.fromarray(transformed)
-
-    return image
+            # Save the generated SoftStrip image
+            img.save(output_image_path)
+            print(f"SoftStrip image saved to {output_image_path}")
 
 
-def generate_softstrip(data):
-    # Original encoding logic remains the same until image creation
-    chunks = []
-    for i in range(0, len(data), CHUNK_SIZE):
-        chunk = data[i:i + CHUNK_SIZE]
-        data_length = len(chunk)
-        length_bits = format(data_length, '016b')
-        chunk_bits = SYNC_HEADER + length_bits + ''.join(format(byte, '08b') for byte in chunk) + SYNC_HEADER
-        chunks.append(chunk_bits)
+        def add_alignment_markers(img):
+            """
+            Adds alignment markers (black and white alternating bars) at the top and bottom of the image.
 
-    data_bits = ''.join(chunks)
+            :param img: PIL Image object.
+            :return: Image with alignment markers added.
+            """
+            img_width, img_height = img.size
+            marker_height = 10  # Height of the alignment marker bars
 
-    dibits = []
-    for i in range(0, len(data_bits), 2):
-        dibit = data_bits[i:i + 2]
-        if dibit == '00':
-            dibits.append(255)
-        elif dibit == '01':
-            dibits.append(192)
-        elif dibit == '10':
-            dibits.append(64)
-        elif dibit == '11':
-            dibits.append(0)
+            # Add top alignment markers
+            for x in range(img_width):
+                if x % 2 == 0:
+                    for y in range(marker_height):
+                        img.putpixel((x, y), 0)  # Black pixel for alignment
 
-    width = 200
-    height = (len(dibits) + width - 1) // width
+            # Add bottom alignment markers
+            for x in range(img_width):
+                if x % 2 == 0:
+                    for y in range(img_height - marker_height, img_height):
+                        img.putpixel((x, y), 0)  # Black pixel for alignment
 
-    img = Image.new('L', (width, height), 255)
-    pixels = img.load()
-
-    for i, dibit_color in enumerate(dibits):
-        x = i % width
-        y = i // width
-        pixels[x, y] = dibit_color
-
-    # Add alignment markers and calibration strip
-    return add_alignment_markers(img)
+            return img
 
 
-def decode_softstrip(image_path, output_file_path):
-    # Load and process image
-    img = Image.open(image_path)
-    img = img.convert("L")
+        # Example usage
+        input_file_path = input("path/to/your/input_file >>>")
+        output_image_path = "softstrip.png"
+        encode_softstrip(input_file_path, output_image_path)
 
-    # Detect markers and transform image
-    img = detect_and_transform(img)
-
-    # Remove margins
-    width, height = img.size
-    img = img.crop((MARGIN_SIZE, MARGIN_SIZE,
-                    width - MARGIN_SIZE,
-                    height - MARGIN_SIZE - CALIBRATION_STRIP_HEIGHT))
-
-    # Convert to numpy array for processing
-    pixels = np.array(img)
-
-    # Color calibration using the calibration strip
-    def calibrate_colors(color):
-        # Map colors to nearest expected value
-        if color > 224:  # White
-            return 255
-        elif color > 128:  # Light gray
-            return 192
-        elif color > 32:  # Dark gray
-            return 64
-        else:  # Black
-            return 0
-
-    # Apply calibration to all pixels
-    calibrated_pixels = np.vectorize(calibrate_colors)(pixels)
-
-    # Convert back to binary stream
-    color_to_dibit = {
-        255: '00',
-        192: '01',
-        64: '10',
-        0: '11'
-    }
-
-    binary_stream = ''
-    for row in calibrated_pixels:
-        for color in row:
-            if color in color_to_dibit:
-                binary_stream += color_to_dibit[color]
-
-    # Decode chunks
-    decoded_data = bytearray()
-    while binary_stream:
-        start_idx = binary_stream.find(SYNC_HEADER)
-        if start_idx == -1:
-            break
-        binary_stream = binary_stream[start_idx + len(SYNC_HEADER):]
-
-        length_bits = binary_stream[:16]
-        data_length = int(length_bits, 2)
-        data_bits = binary_stream[16:16 + (data_length * 8)]
-
-        for i in range(0, len(data_bits), 8):
-            byte = data_bits[i:i + 8]
-            decoded_data.append(int(byte, 2))
-
-        binary_stream = binary_stream[16 + (data_length * 8) + len(SYNC_HEADER):]
-
-    # Write decoded data
-    with open(output_file_path, 'wb') as f:
-        f.write(decoded_data)
-
-    messagebox.showinfo("Success", f"Decoded data saved to {output_file_path}")
-
-
-def select_file_to_encode():
-    file_path = filedialog.askopenfilename(title="Select a text file to encode")
-    if file_path:
-        with open(file_path, 'r', encoding='utf-8') as file:
-            text = file.read()
-        data = text.encode('utf-8')
-        img = generate_softstrip(data)
-
-        # Generate the output path with "_enc" suffix
-        dir_name = os.path.dirname(file_path)
-        base_name = os.path.splitext(os.path.basename(file_path))[0]
-        save_path = os.path.join(dir_name, f"{base_name}_enc.png")
-
-        # Save the encoded image
-        img.save(save_path)
-        messagebox.showinfo("Success", f"Softstrip image saved to {save_path}")
-
-
-def select_file_to_decode():
-    image_path = filedialog.askopenfilename(title="Select a Softstrip image to decode",
-                                            filetypes=[("PNG files", "*.png"), ("JPG files", "*.jpg")])
-    if image_path:
-        # Generate the output path with "_dec" suffix
-        dir_name = os.path.dirname(image_path)
-        base_name = os.path.splitext(os.path.basename(image_path))[0]
-        save_path = os.path.join(dir_name, f"{base_name}_dec.txt")
-
-        # Decode and save the data
-        decode_softstrip(image_path, save_path)
-
-
-# GUI setup remains the same
-root = tk.Tk()
-root.title("Softstrip Encoder/Decoder")
-
-encode_button = tk.Button(root, text="Encode Text File to Softstrip", command=select_file_to_encode)
-encode_button.pack(pady=10)
-
-decode_button = tk.Button(root, text="Decode Softstrip to Text File", command=select_file_to_decode)
-decode_button.pack(pady=10)
-
-root.mainloop()
+    elif choice == "exit":
+        exit(0)
