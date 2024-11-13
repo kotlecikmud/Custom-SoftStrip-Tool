@@ -1,7 +1,7 @@
 """
 ---ABOUT---
 
-Script Name: cauzin_softstrip.py
+Script Name: softstrip_tool.py
 Author: Filip Pawłowski
 Contact: filippawlowski2012@gmail.com
 """
@@ -12,7 +12,7 @@ from PIL import Image
 import os
 
 while True:
-    choice = input(f"Custom Softstrip Tool - v{__version__}\nchoose: encode/decode >>>")
+    choice = input(f"Softstrip Tool - v{__version__}\nchoose: encode/decode >>>")
 
     if choice == "decode":
         def decode_softstrip(softstrip_image_path, img_width=256, padding=10):
