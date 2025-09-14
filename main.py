@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 
 
+# temp comment
 class StripEncoder:
     def __init__(self, input_file_path, output_image_path, dpi=300, module_size=10, data_columns=48):
         if not os.path.exists(input_file_path):
