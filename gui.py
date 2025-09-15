@@ -1,343 +1,285 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox
-from PIL import Image, ImageTk
-import os
-import time
+__version__ = "00.01.01.00"
 
-__version__ = "00.01.00.00"
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, Toplevel
+from PIL import Image, ImageTk
+import cv2
+import numpy as np
+import os
+from softstrip import StripEncoder, StripDecoder
+
 
 class SoftstripGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Softstrip Manual Decoder")
-        self.geometry("800x600")
+        self.title("Softstrip Encoder/Decoder")
+        self.geometry("1200x800")
 
-        self.corners = []
-        self.image_path = None
-        self.original_image = None
-        self.photo_image = None
-        self.scale_factor = 1.0
-        self.file_to_encode = None
+        self.tabs_data = []  # To store data for each tab
+        self.image_paths = []  # Keep a simple list of paths for the autodetect_all function
 
-        # Main frame
         main_frame = tk.Frame(self)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # Canvas for image display
-        self.canvas = tk.Canvas(main_frame, bg="gray")
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.canvas.bind("<Button-1>", self.on_canvas_click)
-        self.canvas.bind("<Motion>", self.on_mouse_move)
-        self.canvas.bind("<Leave>", self.on_mouse_leave)
+        left_frame = tk.Frame(main_frame, width=300, relief=tk.SUNKEN, borderwidth=1)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        left_frame.pack_propagate(False)
 
-        # Magnifier
-        self.magnifier = None
-        self.magnifier_canvas = None
-        self.magnifier_photo = None
-        self.magnifier_size = 100  # The size of the magnifier window
-        self.magnifier_zoom = 3  # The zoom factor
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
-        # Control frame
-        control_frame = tk.Frame(main_frame, width=200, padx=10)
-        control_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        controls_label = tk.Label(left_frame, text="Controls", font=("Helvetica", 16, "bold"))
+        controls_label.pack(pady=10)
 
-        # Instructions
-        instructions = (
-            "Instructions:\n"
-            "1. Load Image.\n"
-            "2. Use 'Autodetect' or manually click the 4 corners\n"
-            "   of the gray data area in order:\n"
-            "   - Top-Left\n"
-            "   - Top-Right\n"
-            "   - Bottom-Right\n"
-            "   - Bottom-Left\n"
-            "3. Click Decode."
-        )
-        self.instructions_label = tk.Label(control_frame, text=instructions, justify=tk.LEFT)
-        self.instructions_label.pack(pady=10)
+        encode_frame = tk.LabelFrame(left_frame, text="Encode File", padx=10, pady=10)
+        encode_frame.pack(pady=20, padx=10, fill=tk.X)
+        self.encode_btn = tk.Button(encode_frame, text="Select File and Encode", command=self.encode_file)
+        self.encode_btn.pack(pady=5, fill=tk.X)
 
-        # Buttons
-        self.load_button = tk.Button(control_frame, text="Load Image", command=self.load_image)
-        self.load_button.pack(fill=tk.X, pady=5)
+        decode_frame = tk.LabelFrame(left_frame, text="Decode Strips", padx=10, pady=10)
+        decode_frame.pack(pady=20, padx=10, fill=tk.X)
 
-        self.decode_button = tk.Button(control_frame, text="Decode", command=self.decode_image)
-        self.decode_button.pack(fill=tk.X, pady=5)
+        self.load_btn = tk.Button(decode_frame, text="Load Strip Image(s)", command=self.load_images)
+        self.load_btn.pack(pady=5, fill=tk.X)
 
-        self.autodetect_button = tk.Button(control_frame, text="Autodetect Corners", command=self.autodetect_corners)
-        self.autodetect_button.pack(fill=tk.X, pady=5)
+        self.autodetect_btn = tk.Button(decode_frame, text="Autodetect & Decode All",
+                                        command=self.autodetect_and_decode, state=tk.DISABLED)
+        self.autodetect_btn.pack(pady=5, fill=tk.X)
 
-        self.reset_button = tk.Button(control_frame, text="Reset Clicks", command=self.reset_clicks)
-        self.reset_button.pack(fill=tk.X, pady=5)
+        manual_frame = tk.LabelFrame(decode_frame, text="Manual Selection", padx=5, pady=5)
+        manual_frame.pack(pady=10, fill=tk.X)
 
-        # --- Debug Frame ---
-        debug_frame = tk.LabelFrame(control_frame, text="Debug")
-        debug_frame.pack(fill=tk.X, expand=False, pady=20)
+        self.manual_mode_var = tk.StringVar(value="bbox")
+        self.bbox_radio = tk.Radiobutton(manual_frame, text="Bounding Box", variable=self.manual_mode_var, value="bbox",
+                                         command=self.reset_manual_selection)
+        self.bbox_radio.pack(anchor=tk.W)
+        self.corners_radio = tk.Radiobutton(manual_frame, text="4 Corners", variable=self.manual_mode_var,
+                                            value="corners", command=self.reset_manual_selection)
+        self.corners_radio.pack(anchor=tk.W)
 
-        self.show_mask_var = tk.IntVar()
-        self.show_mask_check = tk.Checkbutton(debug_frame, text="Show Debug Mask", variable=self.show_mask_var)
-        self.show_mask_check.pack(fill=tk.X, padx=5, anchor="w")
+        self.manual_decode_btn = tk.Button(manual_frame, text="Decode Current Tab Manually",
+                                           command=self.decode_with_manual_points, state=tk.DISABLED)
+        self.manual_decode_btn.pack(pady=5, fill=tk.X)
 
-        self.visualize_bits_var = tk.IntVar()
-        self.visualize_bits_check = tk.Checkbutton(debug_frame, text="Visualize Bit Processing",
-                                                   variable=self.visualize_bits_var)
-        self.visualize_bits_check.pack(fill=tk.X, padx=5, anchor="w")
+        self.clear_btn = tk.Button(manual_frame, text="Clear Manual Selection", command=self.reset_manual_selection,
+                                   state=tk.DISABLED)
+        self.clear_btn.pack(pady=5, fill=tk.X)
 
-        # Status Label
-        self.status_label = tk.Label(control_frame, text="Status: Ready", wraplength=180)
-        self.status_label.pack(pady=20, side=tk.BOTTOM)
+        self.status_label = tk.Label(self, text="Load an image to start.", relief=tk.SUNKEN, anchor=tk.W)
+        self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # --- Encoder Frame ---
-        encoder_frame = tk.LabelFrame(control_frame, text="Encoder")
-        encoder_frame.pack(fill=tk.X, expand=False, pady=20)
+        self.magnifier = Toplevel(self)
+        self.magnifier.overrideredirect(True)
+        self.magnifier.withdraw()
+        self.mag_canvas = tk.Canvas(self.magnifier, width=150, height=150, borderwidth=2, relief=tk.RIDGE)
+        self.mag_canvas.pack()
+        self.mag_canvas.create_line(75, 0, 75, 150, fill="red")
+        self.mag_canvas.create_line(0, 75, 150, 75, fill="red")
+        self.mag_photo = None
 
-        self.select_file_button = tk.Button(encoder_frame, text="Select File to Encode",
-                                            command=self.select_file_to_encode)
-        self.select_file_button.pack(fill=tk.X, pady=5, padx=5)
-
-        self.encode_file_label = tk.Label(encoder_frame, text="No file selected.", wraplength=180)
-        self.encode_file_label.pack(pady=5)
-
-        self.encode_button = tk.Button(encoder_frame, text="Encode and Save As...", command=self.encode_file)
-        self.encode_button.pack(fill=tk.X, pady=5, padx=5)
-
-    def load_image(self):
-        self.image_path = filedialog.askopenfilename(
-            filetypes=[("PNG Images", "*.png"), ("All files", "*.*")]
-        )
-        if not self.image_path:
-            return
-
-        self.reset_clicks()
-        self.original_image = Image.open(self.image_path)
-
-        # Scale image to fit canvas
-        canvas_width = self.canvas.winfo_width()
-        canvas_height = self.canvas.winfo_height()
-
-        # Make sure canvas has a size before scaling
-        if canvas_width == 1 or canvas_height == 1:
-            self.update()  # Update to get the real size
-            canvas_width = self.canvas.winfo_width()
-            canvas_height = self.canvas.winfo_height()
-
-        img_w, img_h = self.original_image.size
-
-        self.scale_factor = 1.0
-        if img_w > canvas_width or img_h > canvas_height:
-            w_ratio = canvas_width / img_w
-            h_ratio = canvas_height / img_h
-            self.scale_factor = min(w_ratio, h_ratio)
-
-        new_width = int(img_w * self.scale_factor)
-        new_height = int(img_h * self.scale_factor)
-
-        display_image = self.original_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-        self.photo_image = ImageTk.PhotoImage(display_image)
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.photo_image)
-        self.canvas.config(scrollregion=self.canvas.bbox(tk.ALL))
-        self.update_status(f"Loaded: {os.path.basename(self.image_path)}")
-
-    def on_canvas_click(self, event):
-        if not self.photo_image:
-            self.update_status("Please load an image first.")
-            return
-
-        if len(self.corners) >= 4:
-            self.update_status("Already have 4 points. Click Reset to start over.")
-            return
-
-        # Get click coordinates on the canvas
-        canvas_x, canvas_y = event.x, event.y
-
-        # Convert to original image coordinates
-        original_x = canvas_x / self.scale_factor
-        original_y = canvas_y / self.scale_factor
-
-        self.corners.append((original_x, original_y))
-
-        # Draw a circle and a number on the canvas at the click location
-        marker_number = len(self.corners)
-        self.canvas.create_oval(canvas_x - 3, canvas_y - 3, canvas_x + 3, canvas_y + 3, fill="red", outline="red",
-                                tags="corner_marker")
-        self.canvas.create_text(canvas_x + 10, canvas_y, text=f"#{marker_number}", fill="white", tags="corner_marker",
-                                anchor="w")
-        self.update_status(f"Point {len(self.corners)} selected. Need {3 - len(self.corners)} more.")
-
-    def autodetect_corners(self):
-        if not self.image_path:
-            self.update_status("Please load an image first.")
-            return
-
-        self.update_status("Autodetecting corners...")
-        self.reset_clicks()
-
-        from softstrip_tool import StripDecoder
-        decoder = StripDecoder(self.image_path, "")  # Output path not needed for corner detection
-
-        if self.show_mask_var.get():
-            mask = decoder.get_debug_mask()
-            if mask is not None:
-                mask_img = Image.fromarray(mask)
-                mask_win = tk.Toplevel(self)
-                mask_win.title("Debug Mask")
-                mask_photo = ImageTk.PhotoImage(mask_img)
-                mask_label = tk.Label(mask_win, image=mask_photo)
-                mask_label.image = mask_photo  # Keep a reference
-                mask_label.pack()
-
-        result = decoder.find_and_get_corners_automatically()
-
-        if result is None:
-            self.update_status("Autodetection failed.")
-            messagebox.showerror("Autodetection Failed", "Could not automatically find the finder patterns.")
-            return
-
-        # The method returns (gray_image, corners_array)
-        _, corners_array = result
-
-        # The corners are TL, TR, BR, BL.
-        self.corners = corners_array.tolist()
-
-        # Draw all 4 corners on the canvas
-        for i, corner in enumerate(self.corners):
-            scaled_corner = (corner[0] * self.scale_factor, corner[1] * self.scale_factor)
-            self.canvas.create_oval(scaled_corner[0] - 3, scaled_corner[1] - 3, scaled_corner[0] + 3,
-                                    scaled_corner[1] + 3, fill="blue", outline="blue", tags="corner_marker")
-            self.canvas.create_text(scaled_corner[0] + 10, scaled_corner[1], text=f"#{i + 1}", fill="white",
-                                    tags="corner_marker", anchor="w")
-
-        self.update_status("Autodetection complete. Verify points or click Decode.")
-
-    def decode_image(self):
-        if len(self.corners) != 4:
-            self.update_status(f"Error: Need 4 points to decode, but have {len(self.corners)}.")
-            return
-
-        self.update_status("Decoding...")
-
-        from softstrip_tool import StripDecoder
-        output_filename = self.image_path.rsplit('.', 1)[0] + "_decoded.txt"
-
-        # Prepare the callback if visualization is enabled
-        callback = None
-        if self.visualize_bits_var.get():
-            callback = self.update_bit_highlight
-
+    def get_current_tab_data(self):
         try:
-            decoder = StripDecoder(self.image_path, output_filename)
-            # Pass the callback to the decoder
-            success = decoder.decode_with_4_points(self.corners, update_callback=callback)
-
-            # Clean up the final highlight marker
-            self.canvas.delete("bit_highlight")
-
-            if success:
-                self.update_status(f"Success! Saved to {output_filename}")
-                messagebox.showinfo("Success", f"Image decoded successfully!\n\nOutput saved to:\n{output_filename}")
-            else:
-                self.update_status("Decoding failed. Check console for errors.")
-                messagebox.showerror("Failure",
-                                     "Could not decode the image. The corners may be inaccurate or the image may be corrupt.")
-        except Exception as e:
-            self.update_status(f"An error occurred: {e}")
-            messagebox.showerror("Error", f"An unexpected error occurred during decoding:\n\n{e}")
-
-    def update_bit_highlight(self, original_coords):
-        # Delete the previous highlight
-        self.canvas.delete("bit_highlight")
-
-        # Scale the coordinate to the canvas
-        canvas_x = original_coords[0] * self.scale_factor
-        canvas_y = original_coords[1] * self.scale_factor
-
-        # Draw a new highlight
-        self.canvas.create_oval(canvas_x - 5, canvas_y - 5, canvas_x + 5, canvas_y + 5,
-                                fill="red", outline="red", tags="bit_highlight")
-
-        # Force canvas to update and pause briefly
-        self.canvas.update_idletasks()
-        time.sleep(0.001)
-
-    def reset_clicks(self):
-        self.corners = []
-        self.canvas.delete("corner_marker")
-        self.update_status("Clicks reset. Select 3 points.")
-
-    def update_status(self, message):
-        self.status_label.config(text=f"Status: {message}")
-
-    def select_file_to_encode(self):
-        self.file_to_encode = filedialog.askopenfilename()
-        if self.file_to_encode:
-            self.encode_file_label.config(text=f"Selected: {os.path.basename(self.file_to_encode)}")
-            self.update_status("File selected for encoding. Click 'Encode and Save As...'")
-        else:
-            self.encode_file_label.config(text="No file selected.")
+            current_tab_index = self.notebook.index(self.notebook.select())
+            if current_tab_index < len(self.tabs_data):
+                return self.tabs_data[current_tab_index]
+        except (tk.TclError, IndexError):
+            return None
+        return None
 
     def encode_file(self):
-        if not self.file_to_encode:
-            messagebox.showerror("Error", "Please select a file to encode first.")
-            return
-
-        output_path = filedialog.asksaveasfilename(
-            defaultextension=".png",
-            filetypes=[("PNG Image", "*.png")],
-            title="Save Encoded Image As..."
-        )
-
-        if not output_path:
-            return  # User cancelled the save dialog
-
-        from softstrip_tool import StripEncoder
+        input_path = filedialog.askopenfilename(title="Select File to Encode")
+        if not input_path: return
+        output_path = filedialog.asksaveasfilename(title="Save Strip Image As", defaultextension=".png",
+                                                   filetypes=[("PNG files", "*.png")])
+        if not output_path: return
         try:
-            self.update_status(f"Encoding to {os.path.basename(output_path)}...")
-            encoder = StripEncoder(self.file_to_encode, output_path)
+            encoder = StripEncoder(input_path, output_path)
             encoder.encode()
-            self.update_status("Encoding successful.")
-            messagebox.showinfo("Success", f"File encoded successfully to:\n{output_path}")
+            messagebox.showinfo("Success", f"File encoded successfully. Check the output folder for the strip images.")
         except Exception as e:
-            self.update_status(f"Encoding failed: {e}")
-            messagebox.showerror("Encoding Failed", f"An error occurred during encoding:\n\n{e}")
+            messagebox.showerror("Encoding Error", f"An error occurred during encoding: {e}")
+
+    def load_images(self):
+        paths = filedialog.askopenfilenames(title="Select Strip Images",
+                                            filetypes=[("PNG files", "*.png"), ("All files", "*.*")])
+        if not paths: return
+        self.image_paths = sorted(list(paths))
+        for tab_id in self.notebook.tabs():
+            self.notebook.forget(tab_id)
+        self.tabs_data.clear()
+        for path in self.image_paths:
+            self.add_image_tab(path)
+        if self.image_paths:
+            self.autodetect_btn.config(state=tk.NORMAL)
+            self.clear_btn.config(state=tk.NORMAL)
+            self.manual_decode_btn.config(state=tk.NORMAL)
+
+    def add_image_tab(self, path):
+        tab_frame = ttk.Frame(self.notebook)
+        tab_name = os.path.basename(path)
+        self.notebook.add(tab_frame, text=tab_name)
+        canvas = tk.Canvas(tab_frame, bg="gray")
+        canvas.pack(fill=tk.BOTH, expand=True)
+        image = Image.open(path)
+        tab_data = {
+            "path": path, "image": image, "canvas": canvas, "photo": None,
+            "scale_factor": 1.0, "manual_points": [], "rect_start": None, "rect_id": None
+        }
+        self.tabs_data.append(tab_data)
+        canvas.bind("<Button-1>", self.on_canvas_click)
+        canvas.bind("<B1-Motion>", self.on_canvas_drag)
+        canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
+        canvas.bind("<Motion>", self.on_mouse_move)
+        self.notebook.select(tab_frame)
+        self.update_idletasks()
+        self.display_image_in_canvas(tab_data)
+
+    def display_image_in_canvas(self, tab_data):
+        canvas, image = tab_data["canvas"], tab_data["image"]
+        canvas_w, canvas_h = canvas.winfo_width(), canvas.winfo_height()
+        img_w, img_h = image.size
+        if canvas_w < 2 or canvas_h < 2:
+            self.after(50, lambda: self.display_image_in_canvas(tab_data))
+            return
+        scale_factor = min(canvas_w / img_w, canvas_h / img_h)
+        display_w, display_h = int(img_w * scale_factor), int(img_h * scale_factor)
+        display_image = image.resize((display_w, display_h), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(display_image)
+        canvas.delete("all")
+        canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+        canvas.config(scrollregion=canvas.bbox(tk.ALL))
+        tab_data["photo"] = photo
+        tab_data["scale_factor"] = scale_factor
+
+    def autodetect_and_decode(self):
+        if not self.image_paths: return
+        all_chunks, final_header = {}, None
+        for i, path in enumerate(self.image_paths):
+            self.notebook.select(i)
+            self.update_idletasks()
+            decoder = StripDecoder(path)
+            result = decoder.decode_chunk()
+            if not result:
+                messagebox.showerror("Decoding Error",
+                                     f"Failed to automatically decode {os.path.basename(path)}. Try manual selection.")
+                return
+            chunk_data, header_info = result
+            all_chunks[header_info['chunk_index']] = chunk_data
+            if final_header is None: final_header = header_info
+        self.reassemble_and_save(all_chunks, final_header)
+
+    def reassemble_and_save(self, all_chunks, header_info):
+        if not header_info or len(all_chunks) != header_info['total_chunks']:
+            messagebox.showerror("Reassembly Error",
+                                 "Could not reassemble file: not all chunks were decoded successfully.")
+            return
+        full_data = bytearray()
+        for i in range(1, header_info['total_chunks'] + 1):
+            if i not in all_chunks:
+                messagebox.showerror("Reassembly Error", f"Missing chunk #{i}!")
+                return
+            full_data.extend(all_chunks[i])
+        final_data = full_data[:header_info['total_file_size']]
+        output_path = filedialog.asksaveasfilename(initialfile=header_info['filename'], title="Save As",
+                                                   filetypes=[("All files", "*.*")])
+        if not output_path: return
+        try:
+            with open(output_path, "wb") as f:
+                f.write(final_data)
+            os.utime(output_path, (header_info['date'].timestamp(), header_info['date'].timestamp()))
+            messagebox.showinfo("Success",
+                                f"File '{os.path.basename(output_path)}' was successfully reassembled and saved.")
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Could not save the file: {e}")
+
+    def on_canvas_click(self, event):
+        tab_data = self.get_current_tab_data()
+        if not tab_data: return
+        mode = self.manual_mode_var.get()
+        if mode == "corners":
+            if len(tab_data["manual_points"]) < 4:
+                tab_data["manual_points"].append((event.x, event.y))
+                tab_data["canvas"].create_oval(event.x - 3, event.y - 3, event.x + 3, event.y + 3, fill="red",
+                                               outline="white", tags="manual_point")
+                tab_data["canvas"].create_text(event.x, event.y - 10, text=f"#{len(tab_data['manual_points'])}",
+                                               fill="white", tags="manual_point")
+        elif mode == "bbox" and tab_data["rect_start"] is None:
+            tab_data["rect_start"] = (event.x, event.y)
+            tab_data["rect_id"] = tab_data["canvas"].create_rectangle(tab_data["rect_start"][0],
+                                                                      tab_data["rect_start"][1],
+                                                                      tab_data["rect_start"][0],
+                                                                      tab_data["rect_start"][1], outline="cyan",
+                                                                      width=2, tags="manual_point")
+
+    def on_canvas_drag(self, event):
+        tab_data = self.get_current_tab_data()
+        if not tab_data or tab_data["rect_start"] is None: return
+        tab_data["canvas"].coords(tab_data["rect_id"], tab_data["rect_start"][0], tab_data["rect_start"][1], event.x,
+                                  event.y)
+
+    def on_canvas_release(self, event):
+        tab_data = self.get_current_tab_data()
+        if not tab_data or tab_data["rect_start"] is None: return
+        end_x, end_y = event.x, event.y
+        start_x, start_y = tab_data["rect_start"]
+        tab_data["rect_start"] = None
+        tl = (min(start_x, end_x), min(start_y, end_y))
+        tr = (max(start_x, end_x), min(start_y, end_y))
+        br = (max(start_x, end_x), max(start_y, end_y))
+        bl = (min(start_x, end_x), max(start_y, end_y))
+        tab_data["manual_points"] = [tl, tr, br, bl]
+
+    def decode_with_manual_points(self):
+        tab_data = self.get_current_tab_data()
+        if not tab_data or not tab_data["manual_points"]:
+            messagebox.showerror("Error", "Please load an image and select points on the current tab first.")
+            return
+        original_corners = np.array(
+            [(p[0] / tab_data["scale_factor"], p[1] / tab_data["scale_factor"]) for p in tab_data["manual_points"]],
+            dtype="float32")
+        decoder = StripDecoder(tab_data["path"])
+        result = decoder.decode_chunk(manual_corners=original_corners)
+        if not result:
+            messagebox.showerror("Decoding Error",
+                                 f"Failed to decode {os.path.basename(tab_data['path'])} with the selected points.")
+            self.reset_manual_selection()
+            return
+        chunk_data, header_info = result
+        self.reassemble_and_save({header_info['chunk_index']: chunk_data}, header_info)
+
+    def reset_manual_selection(self):
+        tab_data = self.get_current_tab_data()
+        if not tab_data: return
+        tab_data["manual_points"] = []
+        tab_data["rect_start"] = None
+        if tab_data.get("rect_id"):
+            tab_data["canvas"].delete(tab_data["rect_id"])
+        tab_data["canvas"].delete("manual_point")
+        mode = self.manual_mode_var.get()
+        self.status_label.config(text=f"Select {'bounding box' if mode == 'bbox' else '4 corners'} on the current tab.")
 
     def on_mouse_move(self, event):
-        if not self.original_image:
+        tab_data = self.get_current_tab_data()
+        if not tab_data or not tab_data.get("image"):
+            self.magnifier.withdraw()
             return
-
-        if not self.magnifier:
-            self.magnifier = tk.Toplevel(self)
-            self.magnifier.overrideredirect(True)  # Remove window decorations
-            self.magnifier.attributes("-topmost", True)  # Keep on top
-            self.magnifier_canvas = tk.Canvas(self.magnifier, width=self.magnifier_size, height=self.magnifier_size)
-            self.magnifier_canvas.pack()
-
-        # Position the magnifier window near the cursor
-        self.magnifier.geometry(f"+{event.x_root + 20}+{event.y_root + 20}")
-
-        # Calculate the region to crop from the original image
-        original_x = event.x / self.scale_factor
-        original_y = event.y / self.scale_factor
-
-        box_half_size = (self.magnifier_size / self.magnifier_zoom) / 2
-
-        left = original_x - box_half_size
-        top = original_y - box_half_size
-        right = original_x + box_half_size
-        bottom = original_y + box_half_size
-
-        cropped_image = self.original_image.crop((left, top, right, bottom))
-
-        # Resize (magnify) the cropped image
-        magnified_image = cropped_image.resize((self.magnifier_size, self.magnifier_size), Image.Resampling.NEAREST)
-
-        self.magnifier_photo = ImageTk.PhotoImage(magnified_image)
-        self.magnifier_canvas.create_image(0, 0, anchor=tk.NW, image=self.magnifier_photo)
-
-    def on_mouse_leave(self, event):
-        if self.magnifier:
-            self.magnifier.destroy()
-            self.magnifier = None
-            self.magnifier_canvas = None
+        canvas = event.widget
+        x, y = canvas.canvasx(event.x), canvas.canvasy(event.y)
+        if 0 <= x < canvas.winfo_width() and 0 <= y < canvas.winfo_height():
+            self.magnifier.geometry(f"+{self.winfo_x() + x + 20}+{self.winfo_y() + y + 20}")
+            self.magnifier.deiconify()
+            orig_x = int(x / tab_data["scale_factor"])
+            orig_y = int(y / tab_data["scale_factor"])
+            box_size = 25
+            box = (orig_x - box_size, orig_y - box_size, orig_x + box_size, orig_y + box_size)
+            region = tab_data["image"].crop(box)
+            zoomed_region = region.resize((150, 150), Image.Resampling.NEAREST)
+            self.mag_photo = ImageTk.PhotoImage(zoomed_region)
+            self.mag_canvas.create_image(0, 0, anchor=tk.NW, image=self.mag_photo)
+            self.mag_canvas.create_line(75, 0, 75, 150, fill="red")
+            self.mag_canvas.create_line(0, 75, 150, 75, fill="red")
+        else:
+            self.magnifier.withdraw()
 
 
 if __name__ == "__main__":
