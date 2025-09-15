@@ -20,6 +20,7 @@ class StripEncoder:
         self.module_size = module_size
         self.data_columns = data_columns
         self.padding_modules = 2
+        self.h_sync_bar_height = 2
 
     def encode(self):
         with open(self.input_file_path, "rb") as f:
@@ -84,19 +85,45 @@ class StripEncoder:
 
     def _calculate_dimensions(self, num_rows):
         padding_pixels = self.module_size * self.padding_modules
-        image_width = self.data_columns * self.module_size + (2 * padding_pixels)
-        image_height = num_rows * self.module_size + (2 * padding_pixels)
+        image_width = (self.data_columns + 2) * self.module_size + (2 * padding_pixels)
+        image_height = (num_rows + self.h_sync_bar_height) * self.module_size + (2 * padding_pixels)
         return image_width, image_height
 
     def _draw_data(self, draw, payload):
         start_offset = self.module_size * self.padding_modules
+        payload_rows = (len(payload) * 8 + self.data_columns - 1) // self.data_columns
+        total_rows = payload_rows + self.h_sync_bar_height
+        gray_background_color = 128
+
+        # Draw vertical sync markers for the entire height
+        for r in range(total_rows):
+            y = start_offset + r * self.module_size
+            color = 0 if r % 2 == 0 else gray_background_color
+
+            # Left marker
+            left_x = start_offset
+            draw.rectangle((left_x, y, left_x + self.module_size - 1, y + self.module_size - 1), fill=color)
+
+            # Right marker
+            right_x = start_offset + (self.data_columns + 1) * self.module_size
+            draw.rectangle((right_x, y, right_x + self.module_size - 1, y + self.module_size - 1), fill=color)
+
+        # Draw horizontal sync bar (between the vertical markers)
+        for r in range(self.h_sync_bar_height):
+            for c in range(self.data_columns):
+                color = 0 if (r + c) % 2 == 0 else gray_background_color
+                x = start_offset + (c + 1) * self.module_size
+                y = start_offset + r * self.module_size
+                draw.rectangle((x, y, x + self.module_size - 1, y + self.module_size - 1), fill=color)
+
+        # Draw payload data (below the horizontal sync bar)
         bit_index = 0
         for byte in payload:
             for i in range(8):
                 if (byte >> (7 - i)) & 1:
                     row, col = divmod(bit_index, self.data_columns)
-                    x = start_offset + col * self.module_size
-                    y = start_offset + row * self.module_size
+                    x = start_offset + (col + 1) * self.module_size
+                    y = start_offset + (row + self.h_sync_bar_height) * self.module_size
                     draw.rectangle((x, y, x + self.module_size - 1, y + self.module_size - 1), fill=0)
                 bit_index += 1
 
@@ -106,6 +133,7 @@ class StripDecoder:
         self.input_image_path = input_image_path
         self.data_columns = data_columns
         self.prepared_frame_width = 1000
+        self.h_sync_bar_height = 2
 
     def decode_chunk(self, manual_corners=None):
         gray_image = self._preprocess_image()
@@ -207,14 +235,20 @@ class StripDecoder:
 
     def _extract_bits_from_frame(self, frame):
         height, width = frame.shape
-        module_size = width / self.data_columns
+        module_size = width / (self.data_columns + 2)
         if module_size == 0: return None
-        num_rows = int(height / module_size + 0.5) + 20
+
+        num_total_rows = int(height / module_size + 0.5)
+        num_payload_rows = num_total_rows - self.h_sync_bar_height
+
         bits = []
-        for r in range(num_rows):
+        # Loop over potential payload rows, with a safety margin
+        for r in range(num_payload_rows + 20):
+            image_row = r + self.h_sync_bar_height
             for c in range(self.data_columns):
-                center_x = int((c + 0.5) * module_size)
-                center_y = int((r + 0.5) * module_size)
+                center_x = int(((c + 1) + 0.5) * module_size)
+                center_y = int((image_row + 0.5) * module_size)
+
                 if 0 <= center_y < height and 0 <= center_x < width:
                     bits.append(1 if frame[center_y, center_x] < 64 else 0)
                 else:
