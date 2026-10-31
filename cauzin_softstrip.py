@@ -126,6 +126,7 @@ class StripInfo:
     more: bool
     strip_type: int
     body: bytes
+    raw: bytes = b""
 
 
 def _directory(files, os_type):
@@ -387,7 +388,9 @@ def _otsu(g):
     with np.errstate(divide="ignore", invalid="ignore"):
         m0, m1 = cumx / w0, (cumx[-1] - cumx) / w1
         var = w0 * w1 * (m0 - m1) ** 2
-    return float(np.nanargmax(np.nan_to_num(var)))
+    var = np.nan_to_num(var)
+    # ties (e.g. a pure 0/255 image: every threshold between them is equally good): take the middle
+    return float(np.flatnonzero(var >= var.max() * (1 - 1e-9)).mean())
 
 
 class _Box:
@@ -464,11 +467,13 @@ def estimate_tilt(g, white=None):
     Dominant gradient direction modulo 90 degrees (a strip is all right angles). One pass of this
     estimator has a ~12% gain error, so it is iterated on a (downsampled) working copy until the
     residual is negligible; the caller rotates the full-size image once by the returned total."""
-    a = np.asarray(g, np.float32)
-    f = int(math.ceil(max(a.shape) / 1800))
+    g = np.asarray(g)
+    f = int(math.ceil(max(g.shape) / 1800))
     if f > 1:
-        h, w = a.shape[0] // f * f, a.shape[1] // f * f
-        a = a[:h, :w].reshape(h // f, f, w // f, f).mean((1, 3))
+        h, w = g.shape[0] // f * f, g.shape[1] // f * f
+        a = g[:h, :w].reshape(h // f, f, w // f, f).mean((1, 3), dtype=np.float32)
+    else:
+        a = g.astype(np.float32)
     fill = float(np.percentile(a, 95)) if white is None else white
     total = 0.0
     for _ in range(4):
@@ -584,6 +589,17 @@ def _regularize(c):
     return out
 
 
+def _band_end(blk):
+    """Row index where rows stop resembling the first rows (None if never)."""
+    ref = blk[1:4].mean(0)
+    ref = ref - ref.mean()
+    rz = blk - blk.mean(1, keepdims=True)
+    corr = (rz @ ref) / (np.linalg.norm(rz, axis=1) * np.linalg.norm(ref) + 1e-9)
+    corr = np.convolve(corr, np.ones(3) / 3, mode="same")
+    drop = np.flatnonzero(corr[4:] < 0.8)
+    return None if drop.size == 0 else float(drop[0] + 4)
+
+
 @dataclass
 class StripRead:
     payload: bytes
@@ -643,6 +659,17 @@ def _decode_upright(gray, refine=True):
             break
     if bar is None:
         raise StripDecodeError("start bar not found")
+    # the strip's true vertical extent is the run of rows in which the start bar is inked: text
+    # printed just above/below the strip (labels, captions) must not be mistaken for its top
+    b0c, b1c = xs + bar[0], xs + bar[1]
+    bw_ = max(2, b1c - b0c)
+    inner = ink[:, max(0, b0c - bw_ // 2): b1c + bw_ // 2]   # bar +- half its width: tolerates curl/tilt
+    vr = _longest_run(inner.mean(1) > 0.35, int(2 * cellest) + 1)
+    if vr is None or vr[1] - vr[0] < 12:
+        raise StripDecodeError("start bar not found")
+    ys, ye = int(vr[0]), int(vr[1])
+    H = ye - ys
+
     # sub-pixel bar edges from the grey-level column profile of the TOP band only (residual tilt
     # has not accumulated there; binary widths are too coarse at 4 px/cell)
     c0 = max(0, xs - 3)
@@ -691,15 +718,53 @@ def _decode_upright(gray, refine=True):
         v4 = box.mean(x4 - hw, yy - 0.5, x4 + hw, yy + 0.5)
         return v4 - v3
 
-    dL = dL_signal(p0)
-    amp = np.percentile(dL, 90) - np.percentile(dL, 10)
-    cr = _crossings(yy, dL, 0.5 * (np.percentile(dL, 90) + np.percentile(dL, 10)), 0.2 * amp)
-    if len(cr) < 4:
-        raise StripDecodeError("no row clock (checkerboard) found")
-    b0 = cr[0]
-    hs_h = b0 - ys
-    if hs_h < 4:
+    # End of the horizontal-sync band, found WITHOUT knowing the cell pitch (which is still only a
+    # rough estimate here): every pixel row of the band is identical, so the band ends where a row
+    # stops correlating with the rows at the very top of the strip.
+    lim = min(H // 2, 600)
+    if lim < 10:
         raise StripDecodeError("horizontal sync not found")
+    yl = np.arange(ys, ys + lim) + 0.5
+    # only the left ~11 cells (start bar, gap, wide block): there a slanted band edge moves < 1 px
+    xsm = np.interp(yl, yy, A)[:, None] + np.arange(-1.0, 11.0 * p0, 1.0)[None, :]
+    # rows are aligned on the tracked bar edge first, so shear / residual tilt cannot decorrelate them
+    blk = box.mean(xsm - 0.5, yl[:, None] - 0.5, xsm + 0.5, yl[:, None] + 0.5)
+    ref = blk[1:4].mean(0)
+    ref = ref - ref.mean()
+    rz = blk - blk.mean(1, keepdims=True)
+    corr = (rz @ ref) / (np.linalg.norm(rz, axis=1) * np.linalg.norm(ref) + 1e-9)
+    corr = np.convolve(corr, np.ones(3) / 3, mode="same")
+    drop = np.flatnonzero(corr[4:] < 0.8)
+    if drop.size == 0:
+        raise StripDecodeError("horizontal sync not found")
+    hs_h = float(drop[0] + 4)
+    b0 = ys + hs_h
+    if hs_h < 5:
+        raise StripDecodeError("horizontal sync not found")
+
+    # ---- row slant (paper shear / feed skew) -------------------------------------------------
+    # The strip's TOP edge is unique (the row pattern itself is periodic) and independent of the
+    # slant direction: compare where ink first appears in a window at the left-hand end with one at
+    # the right-hand end. Only ink presence matters, so the rough pitch is good enough here.
+    Wpx = float(xe - A0)
+    up = min(ys, int(0.04 * Wpx) + 3)                      # supports ~2.3 deg; stays inside label clearance
+    yl2 = np.arange(ys - up, ys + lim) + 0.5
+    Ay2 = np.interp(yl2, yy, A)[:, None]
+
+    def top_edge(urel):
+        xw = Ay2 + urel[None, :]
+        m = box.mean(xw - 0.5, yl2[:, None] - 0.5, xw + 0.5, yl2[:, None] + 0.5).mean(1)
+        i = np.flatnonzero(m < 0.75)
+        if i.size == 0 or i[0] == 0:
+            return None
+        k = i[0]
+        return float(yl2[k - 1] + (m[k - 1] - 0.75) / (m[k - 1] - m[k] + 1e-12))
+
+    tl = top_edge(np.arange(-1.0, 11.0 * p0, 1.0))
+    tr = top_edge(Wpx + np.arange(-13.0 * p0, -2.0 * p0, 1.0))
+    slope = (tr - tl) / max(1.0, Wpx - 12.5 * p0) if (tl is not None and tr is not None) else 0.0
+    if abs(slope) * Wpx > 0.4 * lim:
+        slope = 0.0
 
     # ---- horizontal sync -> nibbles and cell pitch -------------------------------------------
     band = np.arange(ys + 0.2 * hs_h, ys + 0.8 * hs_h)
@@ -707,11 +772,10 @@ def _decode_upright(gray, refine=True):
     if band.size == 0:
         band = np.array([ys + hs_h / 2.0])
     u = np.arange(-3.0, (xe - xs) + 3.0, 0.5)
-    prof = np.zeros_like(u)
-    for y in band:
-        xs_ = Aat(y + 0.5) + u
-        prof += box.mean(xs_ - 0.5, y, xs_ + 0.5, y + 1.0)
-    prof /= len(band)
+    yb = band + 0.5
+    xs_ = np.interp(yb, yy, A)[:, None] + u[None, :]
+    ys_ = yb[:, None] + slope * u[None, :]                   # sample along the slanted rows
+    prof = box.mean(xs_ - 0.5, ys_ - 0.5, xs_ + 0.5, ys_ + 0.5).mean(0)
     edges = []
     for s_, e_ in _runs(prof < 0.5):
         if s_ == 0 or e_ >= len(u):
@@ -733,16 +797,18 @@ def _decode_upright(gray, refine=True):
     meas = np.array(edges)
     sl, ic = np.polyfit(tpl, meas, 1)
     rms = float(np.sqrt(np.mean((meas - (ic + sl * tpl)) ** 2))) / sl
-    if rms > 0.35:
+    if rms > 0.55:
         raise StripDecodeError(f"horizontal sync does not match a {n}-nibble template (rms {rms:.2f} cells)")
     p0 = float(sl)
     w = 8 * n + 14
-
+    delta0 = slope * (w - 4.5) * p0       # slant between the two row-clock columns (left cell 4, right rack)
     # ---- pitch per row from rack edge ------------------------------------------------------------
     dL = dL_signal(p0)
     amp = np.percentile(dL, 90) - np.percentile(dL, 10)
     thrL = 0.5 * (np.percentile(dL, 90) + np.percentile(dL, 10))
     cL = _regularize(_crossings(yy, dL, thrL, 0.2 * amp))
+    if len(cL) < 3:
+        raise StripDecodeError("no row clock (checkerboard) found")
     b0 = cL[0]
     sel = yy > b0
     B_raw = np.full(len(yy), np.nan)
@@ -759,13 +825,17 @@ def _decode_upright(gray, refine=True):
     def pat(y):
         return np.interp(y, yy, pit)
 
-    # right-hand row clock: rack cell (w-1) is ink on odd rows only
-    xr = A + (w - 0.5) * pit
-    hw = 0.3 * pit
-    vR = box.mean(xr - hw, yy - 0.5, xr + hw, yy + 0.5)
-    ampR = np.percentile(vR[sel], 90) - np.percentile(vR[sel], 10)
-    thrR = 0.5 * (np.percentile(vR[sel], 90) + np.percentile(vR[sel], 10))
-    crR = _crossings(yy[sel], vR[sel], thrR, 0.2 * ampR) if ampR > 0.2 else []
+    # right-hand row clock: rack cell (w-1) is ink on odd rows only. With shear the right-hand end of
+    # the last rows lies BELOW the strip's left-hand end, so search that much further down.
+    P0 = float(np.median(np.diff(cL))) if len(cL) > 2 else 10.0
+    yyR = np.arange(int(ys), min(box.H - 1, int(ye + max(0.0, delta0) + 3 * P0))) + 0.5
+    pR = np.interp(yyR, yy, pit)
+    xr = np.interp(yyR, yy, A) + (w - 0.5) * pR
+    vR = box.mean(xr - 0.3 * pR, yyR - 0.5, xr + 0.3 * pR, yyR + 0.5)
+    selR = yyR > b0 + min(0.0, delta0)
+    ampR = np.percentile(vR[selR], 90) - np.percentile(vR[selR], 10)
+    thrR = 0.5 * (np.percentile(vR[selR], 90) + np.percentile(vR[selR], 10))
+    crR = _crossings(yyR[selR], vR[selR], thrR, 0.2 * ampR) if ampR > 0.2 else []
     cR = _regularize(crR)
 
     nrows = len(cL)
@@ -775,13 +845,23 @@ def _decode_upright(gray, refine=True):
     if not 0.5 * P_est <= last_gap <= 1.5 * P_est:
         ybot = cL[-1] + P_est
     bL = np.array(cL + [ybot])
-    if len(cR) == nrows - 1:
-        bR = np.array([bL[0] + (cR[0] - bL[1])] + cR)
-        bR = np.append(bR, bR[-1] + (ybot - cL[-1]))
+    bR = np.full(len(bL), np.nan)
+    bR[0] = b0 + delta0
+    cRa = np.asarray(cR, float)
+    if cRa.size:
+        for k in range(1, nrows):
+            tgt = bL[k] + delta0
+            j = int(np.argmin(np.abs(cRa - tgt)))
+            if abs(cRa[j] - tgt) < 0.4 * P_est:
+                bR[k] = cRa[j]
+    good = np.isfinite(bR[:nrows])
+    if good.mean() >= 0.9:
+        idx = np.arange(nrows)
+        bR[:nrows] = np.interp(idx, idx[good], bR[:nrows][good])
+        bR[nrows] = ybot + (bR[nrows - 1] - bL[nrows - 1])
     else:
-        if cR:
-            notes.append("right row clock inconsistent: flat rows assumed")
-        bR = bL.copy()
+        notes.append("right row clock unreliable: parallel rows assumed")
+        bR = bL + delta0
     topL, botL, topR, botR = bL[:-1], bL[1:], bR[:-1], bR[1:]
     cenL, cenR = (topL + botL) / 2, (topR + botR) / 2
     rowh = ((botL - topL) + (botR - topR)) / 2
@@ -934,20 +1014,31 @@ def _try_orientations(crop, order=(0, 180, 90, 270)):
     raise best or StripDecodeError("no strip")
 
 
+def _rotate8(g8, deg, fill):
+    """Rotate a uint8 page (kept 8-bit: an A4 scan at 600 dpi is 35 Mpx)."""
+    if abs(deg) < 5e-3:
+        return g8
+    im = Image.fromarray(np.ascontiguousarray(g8)).rotate(deg, resample=Image.BICUBIC, expand=True,
+                                                          fillcolor=int(fill))
+    return np.asarray(im)
+
+
 def decode_image(img):
-    """Decode every strip found in a PIL image (single strip or scanned page)."""
-    g = np.asarray(img.convert("L"), np.float32)
-    white = float(np.percentile(g, 95))
-    pad = 8
-    g = np.pad(g, pad, constant_values=white)
+    """Decode every strip found in a PIL image: one strip, or a whole scanned page with many
+    strips (any mix of columns / stacked strips; page or single strips may be rotated)."""
+    g = np.asarray(img.convert("L"))
+    sub = g[:: max(1, g.shape[0] // 500), :: max(1, g.shape[1] // 500)]
+    white = int(np.percentile(sub, 95))
+    g = np.pad(g, 8, constant_values=white)
     alpha = estimate_tilt(g)
-    gr = _rotate(g, alpha, white)
+    gr = _rotate8(g, alpha, white)
+    del g
     reads, last_err = [], None
     for page_rot in (0, 90):
         gp = np.rot90(gr) if page_rot else gr
         for xs, xe, ys, ye in _split_page(gp):
             m = 6
-            crop = gp[max(0, ys - m):ye + m, max(0, xs - m):xe + m]
+            crop = gp[max(0, ys - m):ye + m, max(0, xs - m):xe + m].astype(np.float32)
             try:
                 reads.append(_try_orientations(crop))
             except StripDecodeError as e:
@@ -956,41 +1047,86 @@ def decode_image(img):
             break
     if not reads:           # segmentation can fail on very damaged strips: try the whole image
         try:
-            reads.append(_try_orientations(gr))
+            reads.append(_try_orientations(gr.astype(np.float32)))
         except StripDecodeError as e:
             raise last_err or e
     return reads
 
 
+def load_images(path):
+    """Yield (label, PIL image) for an image file or every page of a PDF (needs PyMuPDF)."""
+    if not path.lower().endswith(".pdf"):
+        with Image.open(path) as im:
+            im.load()
+            yield path, im.copy()
+        return
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        try:
+            import fitz
+        except ImportError:
+            raise StripError("reading PDFs needs PyMuPDF (pip install pymupdf); "
+                             "or export the pages as PNG/TIFF") from None
+    doc = fitz.open(path)
+    for i, page in enumerate(doc, 1):
+        im = None
+        imgs = page.get_images(full=True)
+        if len(imgs) == 1:                 # scanner PDFs hold one full-page image: use it untouched
+            try:
+                im = Image.open(io.BytesIO(doc.extract_image(imgs[0][0])["image"]))
+                im.load()
+            except Exception:              # noqa: BLE001 - fall back to rendering
+                im = None
+        if im is None:
+            pix = page.get_pixmap(dpi=600, colorspace=fitz.csGRAY)
+            im = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+        yield f"{path}[page {i}]", im
+
+
 def decode_paths(paths):
-    """Decode images -> list of sequences, each (os_type, [File]). Also returns messages."""
-    infos, msgs = [], []
+    """Decode images / PDFs -> list of sequences, each (os_type, [File]); plus messages.
+    Strips of one job may be spread over any number of pages and files, in any order."""
+    infos, msgs, found = [], [], 0
     for p in paths:
         try:
-            with Image.open(p) as im:
-                reads = decode_image(im)
+            for label, im in load_images(p):
+                try:
+                    reads = decode_image(im)
+                except StripError as e:
+                    msgs.append(f"{label}: no strip decoded ({e})")
+                    continue
+                for r in reads:
+                    try:
+                        info = parse_payload(r.payload)
+                    except StripError as e:
+                        msgs.append(f"{label}: {e}")
+                        continue
+                    info.raw = r.payload
+                    infos.append(info)
+                    found += 1
+                    msgs.append(f"{label}: strip id={info.strip_id.decode('latin-1').strip()!r} "
+                                f"seq={info.seq}  {r.nibbles} nibbles, {r.rows} rows, "
+                                f"parity-repaired rows {r.bad_rows}")
+                if len(reads) > 1:
+                    msgs.append(f"{label}: {len(reads)} strips on this image")
         except (StripError, OSError) as e:
             msgs.append(f"{p}: {e}")
-            continue
-        for r in reads:
-            try:
-                info = parse_payload(r.payload)
-            except StripError as e:
-                msgs.append(f"{p}: {e}")
-                continue
-            infos.append(info)
-            msgs.append(f"{p}: strip id={info.strip_id.decode('latin-1').strip()!r} seq={info.seq} "
-                        f"{r.nibbles} nibbles, {r.rows} rows, parity-repaired "
-                        f"{r.bad_rows - r.unrepaired_rows}/{r.bad_rows}")
     groups = {}
     for i in infos:
-        groups.setdefault(i.strip_id, {})[i.seq] = i       # duplicate scans of a strip collapse
+        slot = groups.setdefault(i.strip_id, {})
+        if i.seq in slot and slot[i.seq].raw != i.raw:
+            msgs.append(f"warning: id {i.strip_id!r} strip {i.seq} read twice with different content "
+                        "(two jobs sharing an id, or a bad read); keeping the first")
+            continue
+        slot.setdefault(i.seq, i)                   # a strip scanned twice collapses
     seqs = []
     for sid, by_seq in groups.items():
         try:
             seqs.append(assemble(list(by_seq.values())))
         except StripError as e:
-            msgs.append(f"sequence {sid!r}: {e}")
+            have = sorted(by_seq)
+            msgs.append(f"sequence {sid.decode('latin-1').strip()!r}: {e} (have strips {have})")
     return seqs, msgs
 
 
@@ -1019,31 +1155,78 @@ def render_strips(payloads, layout: Layout, margin_px=16):
     return [layout.render(p, margin_px) for p in payloads]
 
 
-def layout_pages(strips, layout: Layout, page="A4", margin_mm=12.0, gap_mm=5.0):
-    """Place strips side by side on pages at true size."""
-    if "x" in str(page).lower() and page not in PAGES_MM:
-        pw, ph = (float(v) for v in page.lower().split("x"))
-    else:
-        pw, ph = PAGES_MM[page]
+def page_size_mm(page):
+    if page in PAGES_MM:
+        return PAGES_MM[page]
+    try:
+        pw, ph = (float(v) for v in str(page).lower().split("x"))
+        return pw, ph
+    except ValueError:
+        raise StripError(f"unknown page size {page!r} (A3 A4 A5 B5 Letter Legal or WxH in mm)") from None
+
+
+LABEL_MM = 5.0
+
+
+def layout_pages(strips, layout: Layout, page="A4", margin_mm=12.0, gap_mm=5.0, labels=None):
+    """Pack strips onto pages at true size. Strips fill a column top to bottom (several short
+    strips stack in one column), then the next column, then the next page. Returns PIL '1' pages
+    whose pixel size matches the paper at the layout's dpi."""
+    from PIL import ImageDraw, ImageFont
+    pw, ph = page_size_mm(page)
     mmpx = layout.mm
     W, H = round(pw / mmpx), round(ph / mmpx)
     mg, gp = round(margin_mm / mmpx), round(gap_mm / mmpx)
-    pages, cur, x = [], None, mg
-    for s in strips:
+    lab = round(LABEL_MM / mmpx) if labels else 0
+    pages, notes = [], []                  # notes[page] = [(x, y, text, max_width)]
+    cur = None
+    x = y = colw = 0
+    for i, s in enumerate(strips):
         a = np.asarray(s.convert("1"))
         ink = ~a
         rows, cols = np.flatnonzero(ink.any(1)), np.flatnonzero(ink.any(0))
         a = a[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
         h, w = a.shape
-        if h > H - 2 * mg or w > W - 2 * mg:
-            raise StripError("strip does not fit on the page; use a smaller --max-length")
-        if cur is None or x + w > W - mg:
+        if h + lab > H - 2 * mg or w > W - 2 * mg:
+            raise StripError("strip does not fit on the page; use a smaller --max-length (or --fill)")
+        if cur is not None and y + h + lab > H - mg:       # column full -> next column
+            x += colw + gp
+            y, colw = mg, 0
+            if x + w > W - mg:
+                cur = None
+        if cur is None:
             cur = np.ones((H, W), bool)
             pages.append(cur)
-            x = mg
-        cur[mg:mg + h, x:x + w] = a
-        x += w + gp
-    return [Image.fromarray(p) for p in pages]
+            notes.append([])
+            x = y = mg
+            colw = 0
+        if labels:
+            notes[-1].append((x, y, labels[i], w))
+        cur[y + lab:y + lab + h, x:x + w] = a
+        y += h + lab + gp
+        colw = max(colw, w)
+    out = []
+    for arr, nl in zip(pages, notes):
+        im = Image.fromarray(arr)
+        if nl:
+            d = ImageDraw.Draw(im)
+            size = max(8, int(lab * 0.62))
+            try:
+                font = ImageFont.load_default(size=size)
+            except TypeError:
+                font = ImageFont.load_default()
+            for lx, ly, text, mw in nl:
+                while len(text) > 1 and d.textlength(text, font=font) > mw:
+                    text = text[:-1]
+                d.text((lx, ly + lab // 8), text, fill=0, font=font)
+        out.append(im)
+    return out
+
+
+def save_pdf(pages, path, dpi):
+    """Ready-to-print PDF: one 1-bit (CCITT G4) image per page at its native resolution, page size
+    = pixels / dpi, so a viewer's 'actual size' prints every bit at its designed size."""
+    pages[0].save(path, "PDF", resolution=float(dpi), save_all=True, append_images=pages[1:])
 
 
 def to_text(data: bytes) -> bytes:
@@ -1281,6 +1464,49 @@ def run_stress(trials=5, seed=7, quick=False, oracle=True, only=None, out=print)
     return results, tot_ok, tot
 
 
+def run_pagetest(out=print):
+    """Multi-strip pages: clean and scanned, packed in stacked columns, with labels, through PDF."""
+    rng = np.random.default_rng(21)
+    lay = Layout(10, 300, 2, 3)                       # 300 dpi page, same physical 0.169x0.254 mm bit
+    files = [File("A.BIN", bytes(rng.integers(0, 256, 9000, dtype=np.uint8))),
+             File("B.TXT", bytes(rng.integers(0, 256, 2500, dtype=np.uint8)))]
+    pls = encode_files(files, lay, "PAGE01", 70)
+    want = [p for p in pls]
+    pages = layout_pages(render_strips(pls, lay, 0), lay, "A5", 10, 5, [f"PAGE01 {i + 1}/{len(pls)}" for i in range(len(pls))])
+    bad = 0
+
+    def check(name, imgs):
+        nonlocal bad
+        got = []
+        for im in imgs:
+            got += [r.payload for r in decode_image(im)]
+        good = sorted(got) == sorted(want)
+        bad += not good
+        out(f"  {'ok  ' if good else 'FAIL'} {name}: {len(got)}/{len(want)} strips on {len(imgs)} page(s)")
+
+    check("clean pages (labels, stacked columns)", pages)
+    sc = [simulate_scan(p, lay, scale=(1.6, 1.6), angle=-1.1, blur=0.7, noise=0.04, jpeg=70, dot_gain=0.3,
+                        gradient=0.15, drift=0.2, margin=50, seed=i) for i, p in enumerate(pages)]
+    check("scanned pages (tilt, 1.6x, JPEG, noise)", sc)
+    check("clean pages rotated 90 deg", [p.rotate(90, expand=True) for p in pages])
+    check("clean pages rotated 180 deg", [p.rotate(180) for p in pages])
+    try:
+        import tempfile
+        import pymupdf  # noqa: F401
+        with tempfile.TemporaryDirectory() as td:
+            fn = os.path.join(td, "t.pdf")
+            save_pdf(pages, fn, lay.dpi)
+            got = []
+            for lab, im in load_images(fn):
+                got += [r.payload for r in decode_image(im)]
+            good = sorted(got) == sorted(want)
+            bad += not good
+            out(f"  {'ok  ' if good else 'FAIL'} PDF round trip: {len(got)}/{len(want)} strips")
+    except ImportError:
+        out("  (PyMuPDF not installed: PDF input test skipped)")
+    return bad
+
+
 def run_selfcheck(out=print):
     """Generator validity: every layout renders a strip that passes the strict structural check
     and whose pixel-exact decode returns the original bytes."""
@@ -1375,9 +1601,13 @@ def run_interop(out=print):
 # CLI
 # --------------------------------------------------------------------------------------
 def _cmd_encode(a):
+    import hashlib
+    import base64
     lay = Layout(a.nibbles, a.dpi, a.cell, a.row)
     for w in lay.warnings():
         print("warning:", w)
+    want_pdf = a.format in ("pdf", "both")
+    page = a.page or ("A4" if want_pdf else None)
     files = []
     for p in a.files:
         with open(p, "rb") as fh:
@@ -1386,33 +1616,46 @@ def _cmd_encode(a):
             data = to_text(data)
         files.append(File(os.path.basename(p).upper()[:60] if a.upper else os.path.basename(p), data,
                           execute=a.exec))
-    payloads = encode_files(files, lay, a.id, a.max_length, a.os)
-    imgs = render_strips(payloads, lay, 0 if a.page else 16)
+    strip_id = a.id or base64.b32encode(hashlib.sha1(
+        b"".join(f.name.encode() + f.data for f in files)).digest())[:6].decode()
+    max_len = a.max_length
+    if a.fill and page:
+        pw, ph = page_size_mm(page)
+        max_len = ph - 2 * a.margin - (LABEL_MM if a.labels else 0)
+        print(f"--fill: strips up to {max_len:.0f} mm so a column uses the full page height")
+    if max_len > 228.6:
+        print("note: strips longer than ~9 in (228.6 mm) do not fit the original hardware reader's "
+              "window; scanner/software decoding is unaffected")
+    if page and a.gap < 3:
+        print("warning: gaps under 3 mm make strips on a tilted scan hard to separate")
+    payloads = encode_files(files, lay, strip_id, max_len, a.os)
     if a.verify:
-        for pl, im_ in zip(payloads, render_strips(payloads, lay)):
+        for im_ in render_strips(payloads, lay):
             verify_strip_image(im_, lay)
         print("verify: all strips pass the structural check")
-    if a.page:
-        pages = layout_pages(imgs, lay, a.page, a.margin, a.gap)
-        outs = []
-        if a.format == "pdf":
-            fn = f"{a.output}.pdf"
-            pages[0].save(fn, "PDF", resolution=lay.dpi, save_all=True, append_images=pages[1:])
-            outs.append(fn)
-        else:
+    labels = [f"{strip_id} {i}/{len(payloads)}" for i in range(1, len(payloads) + 1)] if a.labels else None
+    outs = []
+    if page:
+        imgs = render_strips(payloads, lay, 0)
+        pages = layout_pages(imgs, lay, page, a.margin, a.gap, labels)
+        if a.format in ("png", "both"):
             for i, pg in enumerate(pages, 1):
                 fn = f"{a.output}.png" if len(pages) == 1 else f"{a.output}-page{i}.png"
                 pg.save(fn, dpi=(lay.dpi, lay.dpi))
                 outs.append(fn)
+        if want_pdf:
+            fn = f"{a.output}.pdf"
+            save_pdf(pages, fn, lay.dpi)
+            outs.append(fn)
+        print(f"{len(payloads)} strip(s) on {len(pages)} {page} page(s)")
     else:
-        outs = []
-        for i, im_ in enumerate(imgs, 1):
-            fn = f"{a.output}.png" if len(imgs) == 1 else f"{a.output}-{i}.png"
+        for i, im_ in enumerate(render_strips(payloads, lay), 1):
+            fn = f"{a.output}.png" if len(payloads) == 1 else f"{a.output}-{i}.png"
             im_.save(fn, dpi=(lay.dpi, lay.dpi))
             outs.append(fn)
-    print(f"{len(payloads)} strip(s), {sum(len(p) for p in payloads)} bytes on strip, "
+    print(f"strip id {strip_id!r}: {len(payloads)} strip(s), {sum(len(p) for p in payloads)} bytes on strips, "
           f"strip width {lay.width_mm:.1f} mm, bit {lay.cell_mm:.3f} x {lay.row_mm:.3f} mm")
-    print("Print at 100% / 'actual size' (never 'fit to page'):", ", ".join(outs))
+    print("PRINT AT 100% / 'ACTUAL SIZE' (never 'fit to page'):", ", ".join(outs))
 
 
 def _cmd_decode(a):
@@ -1436,9 +1679,9 @@ def _cmd_verify(a):
     bad = 0
     for p in a.images:
         try:
-            with Image.open(p) as im:
+            for label, im in load_images(p):
                 reads = decode_image(im)
-            print(f"{p}: decodes, {len(reads)} strip(s), parity-failed rows {[r.bad_rows for r in reads]}")
+                print(f"{label}: decodes, {len(reads)} strip(s), parity-failed rows {[r.bad_rows for r in reads]}")
         except StripError as e:
             print(f"{p}: FAIL {e}")
             bad += 1
@@ -1448,6 +1691,8 @@ def _cmd_verify(a):
 def _cmd_stress(a):
     print("== generator validity ==")
     bad = run_selfcheck()
+    print("\n== multi-strip pages ==")
+    bad += run_pagetest()
     print("\n== independent decoder interop ==")
     run_interop()
     print("\n== distortion battery ==")
@@ -1468,15 +1713,20 @@ def build_parser():
     e.add_argument("--cell", type=int, default=4, help="bit width in device px (default 4)")
     e.add_argument("--row", type=int, default=6, help="bit height in device px (default 6)")
     e.add_argument("--max-length", type=float, default=240.0, help="longest strip in mm")
-    e.add_argument("--id", default="STRIP", help="strip id (max 6 chars)")
+    e.add_argument("--id", default=None, help="strip id, max 6 chars (default: derived from the files, "
+                   "so different jobs never share an id)")
     e.add_argument("--os", type=lambda v: int(v, 0), default=0, help="OS type code")
     e.add_argument("--exec", action="store_true", help="mark files executable")
     e.add_argument("--text", action="store_true", help="CRLF line ends + ^Z (Cauzin generic text)")
     e.add_argument("--upper", action="store_true", help="upper-case file names")
-    e.add_argument("--page", help="A3/A4/A5/B5/Letter/Legal or WxH mm: lay strips out on pages")
+    e.add_argument("--page", help="A3/A4/A5/B5/Letter/Legal or WxH mm: pack strips onto pages "
+                   "(columns, short strips stack)")
+    e.add_argument("--fill", action="store_true", help="with a page: make strips as long as the page allows")
+    e.add_argument("--labels", action="store_true", help="print 'id n/total' above every strip")
     e.add_argument("--margin", type=float, default=12.0)
     e.add_argument("--gap", type=float, default=5.0)
-    e.add_argument("--format", choices=["png", "pdf"], default="png")
+    e.add_argument("--format", choices=["png", "pdf", "both"], default="png",
+                   help="pdf = ready-to-print PDF at true size (A4 unless --page given)")
     e.add_argument("--verify", action="store_true", help="run the structural check on every strip")
     d = sp.add_parser("decode", help="scans -> files")
     d.add_argument("images", nargs="+")
