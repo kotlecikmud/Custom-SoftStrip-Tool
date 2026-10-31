@@ -849,11 +849,13 @@ def _decode_upright(gray, refine=True):
     bR[0] = b0 + delta0
     cRa = np.asarray(cR, float)
     if cRa.size:
+        cur_delta = delta0
         for k in range(1, nrows):
-            tgt = bL[k] + delta0
+            tgt = bL[k] + cur_delta
             j = int(np.argmin(np.abs(cRa - tgt)))
-            if abs(cRa[j] - tgt) < 0.4 * P_est:
+            if abs(cRa[j] - tgt) < 0.45 * P_est:
                 bR[k] = cRa[j]
+                cur_delta = 0.8 * cur_delta + 0.2 * (cRa[j] - bL[k])
     good = np.isfinite(bR[:nrows])
     if good.mean() >= 0.9:
         idx = np.arange(nrows)
@@ -939,6 +941,54 @@ def _decode_upright(gray, refine=True):
     if len(stream) < 6 or stream[:3] != bytes(3):
         raise StripDecodeError("data sync bytes are not 00 00 00")
     length = int.from_bytes(stream[3:5], "little")
+    bpr = 4 * n
+    bytes_per_row = bpr // 8
+    needed = 5 + length
+    if len(stream) < needed and (needed - len(stream)) <= 2 * bytes_per_row:
+        missing_rows = int(np.ceil((needed - len(stream)) / bytes_per_row))
+        extra_bits = []
+        cur_bL, cur_bR = bL[-1], bR[-1]
+        for _ in range(missing_rows):
+            nxt_bL, nxt_bR = cur_bL + P_est, cur_bR + P_est
+            cen_L, cen_R = (cur_bL + nxt_bL) / 2, (cur_bR + nxt_bR) / 2
+            row_h = ((nxt_bL - cur_bL) + (nxt_bR - cur_bR)) / 2
+            c_mid = (cen_L + cen_R) / 2
+            rA, rp = Aat(c_mid), pat(c_mid)
+            xl_r, xr_r = rA + 4.0 * rp, rA + (w - 0.5) * rp
+
+            def sample_single(dx=0.0, dy=0.0, ds=0.0):
+                A_, p_ = rA, rp * (1 + ds)
+                xL = A_ + dx * p_ + (5 + 2 * jj + 0.5) * p_
+                xRr = xL + p_
+                frac = (xL - xl_r) / (xr_r - xl_r)
+                yc = cen_L + (cen_R - cen_L) * frac + dy * row_h
+                hw_, hh_ = 0.3 * p_, 0.3 * row_h
+                vl = box.mean(xL - hw_, yc - hh_, xL + hw_, yc + hh_)
+                vr = box.mean(xRr - hw_, yc - hh_, xRr + hw_, yc + hh_)
+                return vl - vr
+
+            sq = sample_single()
+            sbits = (sq > 0).astype(np.uint8)
+            s_ok = (sbits[0] == (sbits[1:-1][1::2].sum() & 1)) and (sbits[-1] == (sbits[1:-1][0::2].sum() & 1))
+            if not s_ok:
+                conf = np.abs(sq)
+                d_row = sbits[1:-1].copy()
+                if sbits[0] != (d_row[1::2].sum() & 1):
+                    cand = np.concatenate([[0], 1 + np.arange(1, 4 * n, 2)])
+                    i_flip = cand[np.argmin(conf[cand])]
+                    sbits[i_flip] ^= 1
+                d_row = sbits[1:-1]
+                if sbits[-1] != (d_row[0::2].sum() & 1):
+                    cand = np.concatenate([[J - 1], 1 + np.arange(0, 4 * n, 2)])
+                    i_flip = cand[np.argmin(conf[cand])]
+                    sbits[i_flip] ^= 1
+            extra_bits.append(sbits[1:-1])
+            cur_bL, cur_bR = nxt_bL, nxt_bR
+
+        if extra_bits:
+            data = np.vstack([data, np.array(extra_bits)])
+            stream = to_bytes(data[k0:].ravel())
+
     if len(stream) < 5 + length:
         raise StripDecodeError(f"strip truncated: needs {5 + length} bytes, read {len(stream)}")
     payload = stream[:5 + length]
